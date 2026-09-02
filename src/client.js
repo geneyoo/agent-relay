@@ -1,4 +1,5 @@
 import net from "node:net";
+import { StringDecoder } from "node:string_decoder";
 
 import { RelayError } from "./errors.js";
 import { defaultSocketPath } from "./paths.js";
@@ -16,6 +17,8 @@ export class RelayClient {
       const socket = net.createConnection({ path: this.socketPath });
       let settled = false;
       let response = "";
+      let responseBytes = 0;
+      const decoder = new StringDecoder("utf8");
 
       const finish = (error, result) => {
         if (settled) return;
@@ -35,11 +38,12 @@ export class RelayClient {
       });
 
       socket.on("data", (chunk) => {
-        response += chunk.toString("utf8");
-        if (Buffer.byteLength(response, "utf8") > MAX_RESPONSE_BYTES) {
+        responseBytes += chunk.length;
+        if (responseBytes > MAX_RESPONSE_BYTES) {
           finish(new RelayError("response_too_large", "relay response exceeded 2 MiB"));
           return;
         }
+        response += decoder.write(chunk);
         const newline = response.indexOf("\n");
         if (newline === -1) return;
 
