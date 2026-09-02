@@ -79,10 +79,14 @@ function envelopeFor(message) {
 }
 
 export class TmuxDelivery {
+  constructor({ runCommand = runTmux } = {}) {
+    this.runCommand = runCommand;
+  }
+
   async inspect({ tmuxSocket, paneId }) {
     assertRelay(typeof tmuxSocket === "string" && tmuxSocket.startsWith("/"), "invalid_tmux_socket", "tmux socket must be absolute");
     assertRelay(/^%\d+$/.test(paneId), "invalid_pane", "invalid tmux pane ID");
-    const { stdout } = await runTmux(tmuxSocket, [
+    const { stdout } = await this.runCommand(tmuxSocket, [
       "display-message",
       "-p",
       "-t",
@@ -112,24 +116,27 @@ export class TmuxDelivery {
     const bufferName = `relay_${message.id.slice(4)}`;
     const envelope = envelopeFor(message);
     try {
-      await runTmux(agent.tmuxSocket, ["load-buffer", "-b", bufferName, "-"], { input: envelope });
+      await this.runCommand(agent.tmuxSocket, ["load-buffer", "-b", bufferName, "-"], { input: envelope });
     } catch (error) {
       throw new DeliveryError(error.code ?? "buffer_load_failed", error.message, false);
     }
 
     try {
-      await runTmux(agent.tmuxSocket, ["paste-buffer", "-p", "-d", "-b", bufferName, "-t", agent.paneId]);
+      await this.runCommand(agent.tmuxSocket, ["paste-buffer", "-p", "-d", "-b", bufferName, "-t", agent.paneId]);
     } catch (error) {
       try {
-        await runTmux(agent.tmuxSocket, ["delete-buffer", "-b", bufferName]);
+        await this.runCommand(agent.tmuxSocket, ["delete-buffer", "-b", bufferName]);
       } catch {
-        // Best-effort cleanup after a definitive paste failure.
+        // Best-effort cleanup after an ambiguous paste failure.
       }
-      throw new DeliveryError(error.code ?? "paste_failed", error.message, false);
+      // Once paste-buffer has been invoked, tmux may have delivered bytes before
+      // reporting or timing out. Never make that payload eligible for automatic
+      // replay merely because the command result was lost.
+      throw new DeliveryError(error.code ?? "paste_failed", error.message, true);
     }
 
     try {
-      await runTmux(agent.tmuxSocket, ["send-keys", "-t", agent.paneId, "Enter"]);
+      await this.runCommand(agent.tmuxSocket, ["send-keys", "-t", agent.paneId, "Enter"]);
     } catch (error) {
       throw new DeliveryError(error.code ?? "submit_failed", error.message, true);
     }
