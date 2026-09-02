@@ -1,0 +1,127 @@
+import fs from "node:fs";
+import net from "node:net";
+import path from "node:path";
+
+import { RelayError } from "./errors.js";
+import { RelayService } from "./service.js";
+import { RelayStore } from "./store.js";
+import { TmuxDelivery } from "./tmux.js";
+
+const MAX_REQUEST_BYTES = 2 * 1024 * 1024;
+
+function serializedError(error) {
+  return {
+    code: error?.code ?? "internal_error",
+    message: error?.code ? error.message : "internal relay error",
+    ...(error?.details === undefined ? {} : { details: error.details }),
+  };
+}
+
+async function socketIsLive(socketPath) {
+  return new Promise((resolve, reject) => {
+    const socket = net.createConnection({ path: socketPath });
+    const timer = setTimeout(() => {
+      socket.destroy();
+      reject(new RelayError("socket_probe_timeout", `timed out probing ${socketPath}`));
+    }, 500);
+    socket.once("connect", () => {
+      clearTimeout(timer);
+      socket.destroy();
+      resolve(true);
+    });
+    socket.once("error", (error) => {
+      clearTimeout(timer);
+      if (error.code === "ECONNREFUSED" || error.code === "ENOENT") resolve(false);
+      else reject(error);
+    });
+  });
+}
+
+async function prepareSocket(socketPath) {
+  fs.mkdirSync(path.dirname(socketPath), { recursive: true, mode: 0o700 });
+  let stat;
+  try {
+    stat = fs.lstatSync(socketPath);
+  } catch (error) {
+    if (error.code === "ENOENT") return;
+    throw error;
+  }
+  if (!stat.isSocket()) {
+    throw new RelayError("unsafe_socket_path", `refusing to replace non-socket path ${socketPath}`);
+  }
+  if (await socketIsLive(socketPath)) {
+    throw new RelayError("daemon_already_running", `a relay daemon is already listening at ${socketPath}`);
+  }
+  fs.unlinkSync(socketPath);
+}
+
+export class RelayDaemon {
+  constructor({ socketPath, statePath, delivery = new TmuxDelivery() }) {
+    this.socketPath = socketPath;
+    this.store = new RelayStore(statePath);
+    this.store.recoverInterruptedDeliveries();
+    this.service = new RelayService({ store: this.store, delivery });
+    this.server = net.createServer((socket) => this.handleConnection(socket));
+    this.closed = false;
+  }
+
+  async listen() {
+    await prepareSocket(this.socketPath);
+    await new Promise((resolve, reject) => {
+      const onError = (error) => reject(error);
+      this.server.once("error", onError);
+      this.server.listen(this.socketPath, () => {
+        this.server.off("error", onError);
+        resolve();
+      });
+    });
+    fs.chmodSync(this.socketPath, 0o600);
+  }
+
+  handleConnection(socket) {
+    let request = "";
+    let handled = false;
+
+    const respond = (payload) => {
+      if (socket.destroyed) return;
+      socket.end(`${JSON.stringify(payload)}\n`);
+    };
+
+    socket.on("data", async (chunk) => {
+      if (handled) return;
+      request += chunk.toString("utf8");
+      if (Buffer.byteLength(request, "utf8") > MAX_REQUEST_BYTES) {
+        handled = true;
+        respond({ ok: false, error: serializedError(new RelayError("request_too_large", "request exceeds 2 MiB")) });
+        return;
+      }
+      const newline = request.indexOf("\n");
+      if (newline === -1) return;
+      handled = true;
+      try {
+        const parsed = JSON.parse(request.slice(0, newline));
+        const result = await this.service.handle(parsed);
+        respond({ ok: true, result });
+      } catch (error) {
+        respond({ ok: false, error: serializedError(error) });
+      }
+    });
+
+    socket.on("error", () => {
+      // A disconnected client must not terminate the daemon.
+    });
+  }
+
+  async close() {
+    if (this.closed) return;
+    this.closed = true;
+    await new Promise((resolve) => this.server.close(resolve));
+    this.store.close();
+    try {
+      const stat = fs.lstatSync(this.socketPath);
+      if (stat.isSocket()) fs.unlinkSync(this.socketPath);
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+  }
+}

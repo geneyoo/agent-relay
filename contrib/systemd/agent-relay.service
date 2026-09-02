@@ -1,0 +1,16 @@
+[Unit]
+Description=Agent Relay daemon
+Documentation=https://github.com/geneyoo/agent-relay
+After=default.target
+
+[Service]
+Type=simple
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/.local/bin/relay daemon run
+Restart=on-failure
+RestartSec=1
+NoNewPrivileges=true
+UMask=0077
+
+[Install]
+WantedBy=default.target
