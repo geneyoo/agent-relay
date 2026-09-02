@@ -44,76 +44,102 @@ login:
 sudo loginctl enable-linger "$USER"
 ```
 
-## Register agents
+## Join agents
 
-From inside each tmux pane, either register an existing CLI:
+Ask each existing Claude or Codex agent to run one command:
 
 ```bash
-relay register coordinator --adapter codex
-relay register reviewer --adapter claude
+relay join coordinator
+relay join reviewer
 ```
 
-Or register and launch it together:
+The relay detects the tmux pane and provider. Once joined, commands issued by
+that agent automatically carry its relay identity.
+
+For a new agent, join and launch it together:
 
 ```bash
-relay start coordinator --adapter codex -- codex
-relay start reviewer --adapter claude -- claude
+relay start coordinator -- codex
+relay start reviewer -- claude
 ```
 
 `relay start` does not intercept the terminal. It registers the current pane,
 sets `AGENT_RELAY_AGENT` for child tool calls, and launches the requested CLI
 with inherited standard input and output. Registration waits until tmux reports
-the expected agent command in the foreground, preventing recovered work from
+Claude or Codex in the foreground, preventing recovered work from
 being delivered into the shell during startup.
 
-## Send and track work
+Check discovery at any time:
 
-Use stdin for arbitrary or multiline messages:
+```bash
+relay whoami
+relay peers
+relay doctor
+```
+
+## Ask another agent
+
+The normal coordinator operation is synchronous and returns only the worker's
+result:
+
+```bash
+relay ask reviewer "Review the authentication change"
+```
+
+The relay persists and injects the task, waits up to 30 seconds for an explicit
+acknowledgement, waits for completion, and prints the result. Use `--timeout`
+to bound the work itself.
+
+## Send asynchronously
+
+`send` injects immediately and prints only the durable message ID:
+
+```bash
+message_id=$(relay send reviewer "Review the authentication change")
+relay wait "$message_id"
+relay result "$message_id"
+```
+
+Use `queue` when the task must wait behind another open relay task:
+
+```bash
+relay queue reviewer "Run this after the current relay task"
+```
+
+Use stdin for arbitrary or multiline content:
 
 ```bash
 printf '%s' 'Review the authentication change.' |
-  relay send reviewer --from coordinator --mode now --stdin
+  relay send reviewer --stdin
 ```
 
-The result includes a message ID. The target acknowledges it:
+The recipient follows the commands embedded in the delivered envelope:
 
 ```bash
-relay accept msg_... --agent reviewer
+relay ack msg_...
+relay done msg_... "Review complete; found one race condition"
+# or
+relay fail msg_... "Blocked by a missing dependency"
 ```
 
-Then records completion:
-
-```bash
-printf '%s' 'Review complete; found one race condition.' |
-  relay complete msg_... --agent reviewer --stdin
-```
-
-The sender can wait without scraping terminal output:
-
-```bash
-relay wait msg_... --for accepted --timeout 30
-relay wait msg_... --for completed
-relay show msg_...
-```
-
-`--mode next` waits behind another open relay message. `--mode now` attempts
-immediate terminal injection. A terminal adapter cannot prove that an
-application semantically steered its active turn; only explicit acceptance
-does that.
+`send` attempts immediate terminal injection. A terminal adapter cannot prove
+that an application semantically steered its active turn; only the explicit
+`ack` establishes acceptance.
 
 From another machine, use the existing SSH trust path rather than exposing a
 new network service:
 
 ```bash
 printf '%s' 'Run the focused tests.' |
-  ssh devbox relay send reviewer --mode now --stdin
+  ssh devbox relay send reviewer --stdin
 ```
 
 ## Agent instruction
 
 Run `relay instructions` and add the resulting behavioral rule to each agent's
-user-level instructions. The rule requires an agent to execute `relay accept`
-before work and `relay complete` or `relay fail` afterward.
+user-level instructions. The rule teaches agents to discover peers with
+`relay peers`, coordinate with `relay ask`, acknowledge incoming work with
+`relay ack`, and finish with `relay done` or `relay fail`.
 
 ## Storage and security
 

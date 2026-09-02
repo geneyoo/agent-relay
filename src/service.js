@@ -1,7 +1,14 @@
 import { RelayError, assertRelay } from "./errors.js";
 import { validateAgentId, validateMessageId } from "./validation.js";
 
-const SUPPORTED_ADAPTERS = new Set(["tmux", "claude", "codex"]);
+const SUPPORTED_ADAPTERS = new Set(["auto", "tmux", "claude", "codex"]);
+
+function detectAdapter(command) {
+  const normalized = command.toLowerCase();
+  if (normalized.includes("claude")) return "claude";
+  if (normalized.includes("codex")) return "codex";
+  throw new RelayError("adapter_not_detected", `pane currently runs ${command}; specify --adapter tmux for a generic target`);
+}
 
 function adapterMatchesCommand(adapter, command) {
   if (adapter === "tmux") return true;
@@ -22,6 +29,8 @@ export class RelayService {
         return { version: 1, pid: process.pid };
       case "register":
         return this.register(request);
+      case "identify":
+        return this.identify(request);
       case "send":
         return this.send(request);
       case "accept":
@@ -45,14 +54,15 @@ export class RelayService {
     }
   }
 
-  async register({ id, adapter = "tmux", tmuxSocket, paneId }) {
+  async register({ id, adapter = "auto", tmuxSocket, paneId }) {
     validateAgentId(id);
     assertRelay(SUPPORTED_ADAPTERS.has(adapter), "unsupported_adapter", `unsupported adapter: ${adapter}`);
     const fingerprint = await this.delivery.inspect({ tmuxSocket, paneId });
-    assertRelay(adapterMatchesCommand(adapter, fingerprint.paneCommand), "adapter_not_ready", `pane ${paneId} currently runs ${fingerprint.paneCommand}, not ${adapter}`);
+    const resolvedAdapter = adapter === "auto" ? detectAdapter(fingerprint.paneCommand) : adapter;
+    assertRelay(adapterMatchesCommand(resolvedAdapter, fingerprint.paneCommand), "adapter_not_ready", `pane ${paneId} currently runs ${fingerprint.paneCommand}, not ${resolvedAdapter}`);
     const agent = this.store.registerAgent({
       id,
-      adapter,
+      adapter: resolvedAdapter,
       tmuxSocket,
       paneId: fingerprint.paneId,
       panePid: fingerprint.panePid,
@@ -62,7 +72,20 @@ export class RelayService {
     return agent;
   }
 
-  async send({ sender, recipient, parentId = null, mode = "next", body, idempotencyKey = null }) {
+  async identify({ tmuxSocket, paneId }) {
+    const agent = this.store.findAgentByPane(tmuxSocket, paneId);
+    if (!agent) return null;
+    try {
+      const fingerprint = await this.delivery.inspect({ tmuxSocket, paneId });
+      if (fingerprint.panePid !== agent.panePid) return null;
+      if (agent.adapter !== "tmux" && fingerprint.paneCommand !== agent.paneCommand) return null;
+      return agent;
+    } catch {
+      return null;
+    }
+  }
+
+  async send({ sender, recipient, parentId = null, mode = "now", body, idempotencyKey = null }) {
     const created = this.store.createMessage({ sender, recipient, parentId, mode, body, idempotencyKey });
     if (!created.created) return created;
     const message = await this.withTargetLock(recipient, async () => {
@@ -74,16 +97,20 @@ export class RelayService {
     return { message, created: true };
   }
 
-  accept({ id, agent }) {
+  accept({ id, agent = undefined }) {
     validateMessageId(id);
-    validateAgentId(agent);
-    return this.store.acceptMessage(id, agent);
+    const message = this.store.requireMessage(id);
+    const resolvedAgent = agent ?? message.recipient;
+    validateAgentId(resolvedAgent);
+    return this.store.acceptMessage(id, resolvedAgent);
   }
 
-  async finish({ id, agent, result = "" }, state) {
+  async finish({ id, agent = undefined, result = "" }, state) {
     validateMessageId(id);
-    validateAgentId(agent);
-    const message = this.store.finishMessage(id, agent, state, result);
+    const existing = this.store.requireMessage(id);
+    const resolvedAgent = agent ?? existing.recipient;
+    validateAgentId(resolvedAgent);
+    const message = this.store.finishMessage(id, resolvedAgent, state, result);
     await this.dispatchNext(message.recipient);
     return message;
   }

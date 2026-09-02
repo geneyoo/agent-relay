@@ -11,19 +11,30 @@ const HELP = `agent-relay: durable messaging for agents in tmux panes
 Usage:
   relay daemon run [--socket PATH] [--state PATH]
   relay daemon ping [--socket PATH]
-  relay register NAME [--adapter tmux|claude|codex] [--pane %N]
-  relay start NAME [--adapter tmux|claude|codex] -- COMMAND [ARG...]
-  relay send RECIPIENT [MESSAGE] [--from NAME] [--mode now|next] [--stdin]
-  relay accept MESSAGE_ID [--agent NAME]
-  relay complete MESSAGE_ID [RESULT] [--agent NAME] [--stdin]
-  relay fail MESSAGE_ID [RESULT] [--agent NAME] [--stdin]
+  relay join NAME
+  relay start NAME -- COMMAND [ARG...]
+  relay ask RECIPIENT MESSAGE [--timeout SECONDS]
+  relay send RECIPIENT MESSAGE
+  relay queue RECIPIENT MESSAGE
+  relay ack MESSAGE_ID
+  relay done MESSAGE_ID RESULT
+  relay fail MESSAGE_ID RESULT
+  relay result MESSAGE_ID
   relay show MESSAGE_ID
   relay inbox [--agent NAME] [--state STATE] [--include-body]
-  relay agents
+  relay peers
+  relay whoami
+  relay doctor
   relay status
   relay wait MESSAGE_ID [--for accepted|completed] [--timeout SECONDS]
   relay retry MESSAGE_ID --force
   relay instructions
+
+Advanced:
+  relay register NAME [--adapter auto|tmux|claude|codex] [--pane %N]
+  relay agents
+  relay accept MESSAGE_ID [--agent NAME]
+  relay complete MESSAGE_ID RESULT [--agent NAME] [--stdin]
 
 Global options:
   --socket PATH   Override the Unix socket path
@@ -31,8 +42,15 @@ Global options:
   -h, --help      Show this help
 `;
 
-const AGENT_INSTRUCTIONS = `When input begins with [relay id=...], treat it as a durable relay message.
-First run the exact "relay accept" command included in the envelope. Do not repeat work for a message that is already accepted or completed. Complete the requested work, then send a concise result through the included "relay complete" command using --stdin. If the work cannot be completed, use "relay fail" instead. Never claim relay acceptance or completion without running the corresponding command.`;
+const AGENT_INSTRUCTIONS = [
+  "Use agent-relay instead of tmux send-keys when communicating with another terminal agent.",
+  'Run `relay peers` to discover available agents and `relay ask NAME "task"` when you need a response.',
+  "",
+  "When input begins with `[relay MESSAGE_ID from=NAME]`, it is a durable relay task.",
+  "Immediately run the exact `relay ack` command in the envelope. Do not repeat work for a message already accepted or completed.",
+  "Complete the task, then run the exact `relay done` command with a concise result, or `relay fail` with the reason.",
+  "Never claim acknowledgement or completion without running the corresponding relay command.",
+].join("\n");
 
 function parseArgs(tokens) {
   const positional = [];
@@ -74,16 +92,31 @@ function clientFrom(options) {
   return new RelayClient({ socketPath: socketFrom(options) });
 }
 
-function agentFrom(options) {
-  return options.agent || process.env.AGENT_RELAY_AGENT;
-}
-
 function tmuxCoordinates(options) {
   const paneId = options.pane || process.env.TMUX_PANE;
   const tmuxSocket = options["tmux-socket"] || process.env.TMUX?.split(",", 1)[0];
   assertRelay(paneId, "pane_required", "no tmux pane found; run inside tmux or pass --pane");
   assertRelay(tmuxSocket, "tmux_socket_required", "no tmux socket found; run inside tmux or pass --tmux-socket");
   return { paneId, tmuxSocket };
+}
+
+function availableTmuxCoordinates(options = {}) {
+  const paneId = options.pane || process.env.TMUX_PANE;
+  const tmuxSocket = options["tmux-socket"] || process.env.TMUX?.split(",", 1)[0];
+  return paneId && tmuxSocket ? { paneId, tmuxSocket } : null;
+}
+
+async function identifyCurrentAgent(client, options = {}) {
+  if (options.agent) return options.agent;
+  if (process.env.AGENT_RELAY_AGENT) return process.env.AGENT_RELAY_AGENT;
+  const coordinates = availableTmuxCoordinates(options);
+  if (!coordinates) return null;
+  const agent = await client.identify(coordinates);
+  return agent?.id ?? null;
+}
+
+async function senderFrom(client, options) {
+  return options.from || await identifyCurrentAgent(client, options) || "human";
 }
 
 async function stdinText() {
@@ -118,6 +151,61 @@ function messageReached(message, target) {
 
 function sleep(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function waitForMessage(client, id, target, timeoutSeconds = 0) {
+  assertRelay(target === "accepted" || target === "completed", "invalid_wait_target", "wait target must be accepted or completed");
+  assertRelay(Number.isFinite(timeoutSeconds) && timeoutSeconds >= 0, "invalid_timeout", "timeout must be a non-negative number");
+  const deadline = timeoutSeconds === 0 ? Infinity : Date.now() + timeoutSeconds * 1000;
+  while (true) {
+    const result = await client.show(id);
+    if (messageReached(result, target)) return result;
+    if (["failed", "cancelled"].includes(result.state)) {
+      throw new RelayError("message_terminal", `${id} finished as ${result.state}${result.result ? `: ${result.result}` : ""}`);
+    }
+    if (Date.now() >= deadline) throw new RelayError("wait_timeout", `timed out waiting for ${id} to become ${target}`);
+    await sleep(250);
+  }
+}
+
+async function doctor(options) {
+  const checks = [];
+  const client = clientFrom(options);
+  try {
+    const ping = await client.ping();
+    checks.push({ name: "daemon", ok: true, detail: `protocol ${ping.version}, pid ${ping.pid}` });
+  } catch (error) {
+    checks.push({ name: "daemon", ok: false, detail: error.message });
+  }
+
+  const coordinates = availableTmuxCoordinates(options);
+  if (coordinates) {
+    checks.push({ name: "tmux", ok: true, detail: coordinates.paneId });
+    try {
+      const agent = await client.identify(coordinates);
+      checks.push(agent
+        ? { name: "identity", ok: true, detail: `${agent.id} (${agent.adapter})` }
+        : { name: "identity", ok: false, detail: "current pane has not joined; run relay join NAME from the agent" });
+    } catch (error) {
+      checks.push({ name: "identity", ok: false, detail: error.message });
+    }
+  } else {
+    checks.push({ name: "tmux", ok: true, detail: "not in tmux; remote client mode" });
+  }
+
+  for (const [name, filename] of [
+    ["codex instructions", `${process.env.HOME}/.codex/AGENTS.md`],
+    ["claude instructions", `${process.env.HOME}/.claude/CLAUDE.md`],
+  ]) {
+    checks.push({ name, ok: fs.existsSync(filename), detail: filename });
+  }
+
+  const ok = checks.every((check) => check.ok);
+  if (options.json) print({ ok, checks }, true);
+  else {
+    for (const check of checks) process.stdout.write(`${check.ok ? "ok" : "FAIL"}\t${check.name}\t${check.detail}\n`);
+  }
+  if (!ok) process.exitCode = 1;
 }
 
 async function runDaemon(parsed) {
@@ -179,7 +267,7 @@ async function runRegisteredCommand(name, adapter, command, commandArgs, options
       registered = true;
     } catch (error) {
       lastError = error;
-      if (error.code !== "adapter_not_ready") break;
+      if (error.code !== "adapter_not_ready" && error.code !== "adapter_not_detected") break;
       await sleep(100);
     }
   }
@@ -221,58 +309,73 @@ export async function main(argv) {
   const client = clientFrom(parsed.options);
 
   switch (command) {
+    case "join":
     case "register": {
       const id = parsed.positional[0];
-      assertRelay(id, "agent_required", "register requires an agent name");
+      assertRelay(id, "agent_required", `${command} requires an agent name`);
       const result = await client.register({
         id,
-        adapter: parsed.options.adapter || "tmux",
+        adapter: parsed.options.adapter || "auto",
         ...tmuxCoordinates(parsed.options),
       });
-      print(parsed.options.json ? result : `${result.id} -> ${result.paneId} (${result.adapter})`, parsed.options.json);
+      print(parsed.options.json ? result : `joined as ${result.id} (${result.adapter}, ${result.paneId})`, parsed.options.json);
       return;
     }
     case "start": {
       const id = parsed.positional[0];
       assertRelay(id, "agent_required", "start requires an agent name");
-      await runRegisteredCommand(id, parsed.options.adapter || "tmux", parsed.rest[0], parsed.rest.slice(1), parsed.options);
+      await runRegisteredCommand(id, parsed.options.adapter || "auto", parsed.rest[0], parsed.rest.slice(1), parsed.options);
       return;
     }
-    case "send": {
+    case "ask":
+    case "send":
+    case "queue": {
       const recipient = parsed.positional[0];
-      assertRelay(recipient, "recipient_required", "send requires a recipient");
+      assertRelay(recipient, "recipient_required", `${command} requires a recipient`);
       const body = await bodyFrom(parsed, 1);
+      if (command === "ask") {
+        const peers = await client.agents();
+        assertRelay(peers.some((peer) => peer.id === recipient), "unknown_recipient", `${recipient} has not joined the relay`);
+      }
       const result = await client.send({
-        sender: parsed.options.from || process.env.AGENT_RELAY_AGENT || "human",
+        sender: await senderFrom(client, parsed.options),
         recipient,
         parentId: parsed.options.parent || null,
-        mode: parsed.options.mode || "next",
+        mode: parsed.options.mode || (command === "queue" ? "next" : "now"),
         idempotencyKey: parsed.options.key || null,
         body,
       });
-      print(parsed.options.json ? result : `${result.message.id} ${result.message.state}${result.created ? "" : " (existing)"}`, parsed.options.json);
+      if (command !== "ask") {
+        print(parsed.options.json ? result : result.message.id, parsed.options.json);
+        return;
+      }
+
+      assertRelay(result.message.state === "injected" || result.message.state === "accepted" || result.message.state === "completed", "delivery_not_confirmed", `${result.message.id} is ${result.message.state}; inspect it with relay show ${result.message.id}`);
+      if (!parsed.options.json) process.stderr.write(`relay: ${result.message.id} injected; waiting for ${recipient}\n`);
+      const acceptTimeout = Number(parsed.options["accept-timeout"] || 30);
+      await waitForMessage(client, result.message.id, "accepted", acceptTimeout);
+      const completed = await waitForMessage(client, result.message.id, "completed", Number(parsed.options.timeout || 0));
+      print(parsed.options.json ? completed : (completed.result || `${completed.id} completed`), parsed.options.json);
       return;
     }
+    case "ack":
     case "accept": {
       const id = parsed.positional[0];
-      const agent = agentFrom(parsed.options);
-      assertRelay(id, "message_required", "accept requires a message ID");
-      assertRelay(agent, "agent_required", "accept requires --agent or AGENT_RELAY_AGENT");
-      const result = await client.accept(id, agent);
-      print(parsed.options.json ? result : `${result.id} ${result.state}`, parsed.options.json);
+      assertRelay(id, "message_required", `${command} requires a message ID`);
+      const result = await client.accept(id, parsed.options.agent);
+      print(parsed.options.json ? result : `acknowledged ${result.id}`, parsed.options.json);
       return;
     }
+    case "done":
     case "complete":
     case "fail": {
       const id = parsed.positional[0];
-      const agent = agentFrom(parsed.options);
       assertRelay(id, "message_required", `${command} requires a message ID`);
-      assertRelay(agent, "agent_required", `${command} requires --agent or AGENT_RELAY_AGENT`);
-      const resultBody = await bodyFrom(parsed, 1, { allowEmpty: true });
-      const result = command === "complete"
-        ? await client.complete(id, agent, resultBody)
-        : await client.fail(id, agent, resultBody);
-      print(parsed.options.json ? result : `${result.id} ${result.state}`, parsed.options.json);
+      const resultBody = await bodyFrom(parsed, 1);
+      const result = command === "fail"
+        ? await client.fail(id, resultBody, parsed.options.agent)
+        : await client.complete(id, resultBody, parsed.options.agent);
+      print(parsed.options.json ? result : `${result.state} ${result.id}`, parsed.options.json);
       return;
     }
     case "show": {
@@ -281,9 +384,17 @@ export async function main(argv) {
       print(await client.show(id), parsed.options.json);
       return;
     }
+    case "result": {
+      const id = parsed.positional[0];
+      assertRelay(id, "message_required", "result requires a message ID");
+      const result = await client.show(id);
+      assertRelay(result.state === "completed", "result_not_ready", `${id} is ${result.state}`);
+      print(parsed.options.json ? result : result.result, parsed.options.json);
+      return;
+    }
     case "inbox": {
-      const agent = agentFrom(parsed.options);
-      assertRelay(agent, "agent_required", "inbox requires --agent or AGENT_RELAY_AGENT");
+      const agent = await identifyCurrentAgent(client, parsed.options);
+      assertRelay(agent, "agent_required", "inbox requires a joined pane or --agent NAME");
       const limit = Number(parsed.options.limit || 50);
       print(await client.inbox(agent, {
         state: parsed.options.state || null,
@@ -292,8 +403,25 @@ export async function main(argv) {
       }), parsed.options.json);
       return;
     }
+    case "peers":
     case "agents":
-      print(await client.agents(), parsed.options.json);
+      {
+        const agents = await client.agents();
+        if (parsed.options.json) print(agents, true);
+        else if (agents.length === 0) process.stdout.write("no agents have joined\n");
+        else for (const agent of agents) process.stdout.write(`${agent.id}\t${agent.adapter}\t${agent.paneId}${agent.lastError ? `\t${agent.lastError}` : ""}\n`);
+      }
+      return;
+    case "whoami": {
+      const coordinates = availableTmuxCoordinates(parsed.options);
+      assertRelay(coordinates, "tmux_required", "whoami must run from tmux");
+      const agent = await client.identify(coordinates);
+      assertRelay(agent, "not_joined", "this pane has not joined; run relay join NAME from the agent");
+      print(parsed.options.json ? agent : agent.id, parsed.options.json);
+      return;
+    }
+    case "doctor":
+      await doctor(parsed.options);
       return;
     case "status":
       print(await client.status(), parsed.options.json);
@@ -302,25 +430,11 @@ export async function main(argv) {
       const id = parsed.positional[0];
       const target = parsed.options.for || "completed";
       assertRelay(id, "message_required", "wait requires a message ID");
-      assertRelay(target === "accepted" || target === "completed", "invalid_wait_target", "--for must be accepted or completed");
       const timeoutSeconds = Number(parsed.options.timeout || 0);
-      assertRelay(Number.isFinite(timeoutSeconds) && timeoutSeconds >= 0, "invalid_timeout", "timeout must be a non-negative number");
-      const deadline = timeoutSeconds === 0 ? Infinity : Date.now() + timeoutSeconds * 1000;
-      while (true) {
-        const result = await client.show(id);
-        if (messageReached(result, target)) {
-          if (target === "completed" && result.state !== "completed") {
-            throw new RelayError("message_not_completed", `${id} finished as ${result.state}`);
-          }
-          print(parsed.options.json ? result : `${result.id} ${result.state}`, parsed.options.json);
-          return;
-        }
-        if (["failed", "cancelled"].includes(result.state)) {
-          throw new RelayError("message_terminal", `${id} finished as ${result.state}`);
-        }
-        if (Date.now() >= deadline) throw new RelayError("wait_timeout", `timed out waiting for ${id} to become ${target}`);
-        await sleep(250);
-      }
+      const result = await waitForMessage(client, id, target, timeoutSeconds);
+      if (target === "completed" && result.state !== "completed") throw new RelayError("message_not_completed", `${id} finished as ${result.state}`);
+      print(parsed.options.json ? result : `${result.id} ${result.state}`, parsed.options.json);
+      return;
     }
     case "retry": {
       const id = parsed.positional[0];

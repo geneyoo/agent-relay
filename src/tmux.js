@@ -66,12 +66,14 @@ function runTmux(socketPath, args, { input = undefined, timeoutMs = COMMAND_TIME
 
 function envelopeFor(message) {
   return [
-    `[relay id=${message.id} from=${message.sender} mode=${message.mode}]`,
-    `First run: relay accept ${message.id} --agent ${message.recipient}`,
+    `[relay ${message.id} from=${message.sender}]`,
+    `ACK NOW: relay ack ${message.id}`,
     "",
+    "TASK:",
     message.body,
     "",
-    `When finished: relay complete ${message.id} --agent ${message.recipient} --stdin`,
+    `DONE: relay done ${message.id} "concise result"`,
+    `FAIL: relay fail ${message.id} "reason"`,
     "[/relay]",
   ].join("\n");
 }

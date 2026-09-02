@@ -34,10 +34,15 @@ If the daemon stops while a message is `injecting`, it recovers that message as
 retry is an explicit at-least-once operation and recipients must deduplicate by
 message ID.
 
+The SQLite database uses `PRAGMA user_version` for ordered schema migrations.
+The current schema version is `1`; a daemon refuses to open a database created
+by a newer incompatible version.
+
 ## Operations
 
 - `ping`
 - `register`
+- `identify`
 - `send`
 - `accept`
 - `complete`

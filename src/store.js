@@ -17,6 +17,8 @@ const MESSAGE_STATES = new Set([
   "cancelled",
 ]);
 
+export const CURRENT_SCHEMA_VERSION = 1;
+
 function now() {
   return new Date().toISOString();
 }
@@ -85,6 +87,27 @@ export class RelayStore {
     this.db.exec("PRAGMA journal_mode = WAL");
     this.db.exec("PRAGMA foreign_keys = ON");
     this.db.exec("PRAGMA busy_timeout = 5000");
+    this.migrate();
+  }
+
+  migrate() {
+    const row = this.db.prepare("PRAGMA user_version").get();
+    const version = Number(row.user_version);
+    assertRelay(version <= CURRENT_SCHEMA_VERSION, "database_too_new", `database schema ${version} is newer than supported schema ${CURRENT_SCHEMA_VERSION}`);
+    if (version === CURRENT_SCHEMA_VERSION) return;
+
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      if (version < 1) this.migrateToVersion1();
+      this.db.exec(`PRAGMA user_version = ${CURRENT_SCHEMA_VERSION}`);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  migrateToVersion1() {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS agents (
         id TEXT PRIMARY KEY,
@@ -122,6 +145,9 @@ export class RelayStore {
 
       CREATE INDEX IF NOT EXISTS messages_recipient_state_created
         ON messages(recipient, state, created_at);
+
+      CREATE UNIQUE INDEX IF NOT EXISTS agents_tmux_pane_unique
+        ON agents(tmux_socket, pane_id);
 
       CREATE TABLE IF NOT EXISTS events (
         sequence INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -180,23 +206,27 @@ export class RelayStore {
     assertRelay(Number.isSafeInteger(panePid) && panePid > 0, "invalid_pane_pid", "tmux pane PID must be a positive integer");
     assertRelay(typeof paneCommand === "string" && paneCommand.length > 0 && paneCommand.length <= 256, "invalid_pane_command", "tmux pane command is required");
 
-    const timestamp = now();
-    this.db.prepare(`
-      INSERT INTO agents(id, adapter, tmux_socket, pane_id, pane_pid, pane_command, registered_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET
-        adapter = excluded.adapter,
-        tmux_socket = excluded.tmux_socket,
-        pane_id = excluded.pane_id,
-        pane_pid = excluded.pane_pid,
-        pane_command = excluded.pane_command,
-        generation = agents.generation + 1,
-        registered_at = excluded.registered_at,
-        updated_at = excluded.updated_at,
-        last_error = NULL
-    `).run(id, adapter, tmuxSocket, paneId, panePid, paneCommand, timestamp, timestamp);
-    this.event(null, "agent_registered", { id, adapter, tmuxSocket, paneId, panePid, paneCommand });
-    return this.getAgent(id);
+    return this.transaction(() => {
+      const existingPane = this.findAgentByPane(tmuxSocket, paneId);
+      assertRelay(!existingPane || existingPane.id === id, "pane_already_registered", `${paneId} is already registered as ${existingPane?.id}`);
+      const timestamp = now();
+      this.db.prepare(`
+        INSERT INTO agents(id, adapter, tmux_socket, pane_id, pane_pid, pane_command, registered_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          adapter = excluded.adapter,
+          tmux_socket = excluded.tmux_socket,
+          pane_id = excluded.pane_id,
+          pane_pid = excluded.pane_pid,
+          pane_command = excluded.pane_command,
+          generation = agents.generation + 1,
+          registered_at = excluded.registered_at,
+          updated_at = excluded.updated_at,
+          last_error = NULL
+      `).run(id, adapter, tmuxSocket, paneId, panePid, paneCommand, timestamp, timestamp);
+      this.event(null, "agent_registered", { id, adapter, tmuxSocket, paneId, panePid, paneCommand });
+      return this.getAgent(id);
+    });
   }
 
   getAgent(id) {
@@ -208,11 +238,17 @@ export class RelayStore {
     return this.db.prepare("SELECT * FROM agents ORDER BY id").all().map(mapAgent);
   }
 
+  findAgentByPane(tmuxSocket, paneId) {
+    assertRelay(typeof tmuxSocket === "string" && tmuxSocket.startsWith("/"), "invalid_tmux_socket", "tmux socket must be an absolute path");
+    assertRelay(typeof paneId === "string" && /^%\d+$/.test(paneId), "invalid_pane", "tmux pane must look like %12");
+    return mapAgent(this.db.prepare("SELECT * FROM agents WHERE tmux_socket = ? AND pane_id = ?").get(tmuxSocket, paneId));
+  }
+
   setAgentError(id, error = null) {
     this.db.prepare("UPDATE agents SET last_error = ?, updated_at = ? WHERE id = ?").run(error, now(), id);
   }
 
-  createMessage({ sender, recipient, parentId = null, mode = "next", body, idempotencyKey = null }) {
+  createMessage({ sender, recipient, parentId = null, mode = "now", body, idempotencyKey = null }) {
     validateAgentId(sender, "sender");
     validateAgentId(recipient, "recipient");
     validateMode(mode);

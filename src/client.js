@@ -82,19 +82,23 @@ export class RelayClient {
     return this.request("register", input);
   }
 
+  identify(input) {
+    return this.request("identify", input);
+  }
+
   send(input) {
     return this.request("send", input, { timeoutMs: 15000 });
   }
 
-  accept(id, agent) {
+  accept(id, agent = undefined) {
     return this.request("accept", { id, agent });
   }
 
-  complete(id, agent, result = "") {
+  complete(id, result = "", agent = undefined) {
     return this.request("complete", { id, agent, result });
   }
 
-  fail(id, agent, result = "") {
+  fail(id, result = "", agent = undefined) {
     return this.request("fail", { id, agent, result });
   }
 

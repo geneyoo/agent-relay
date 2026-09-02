@@ -1,6 +1,6 @@
 {
   "name": "@geneyoo/agent-relay",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A durable, headless message relay for terminal-based coding agents",
   "repository": "github:geneyoo/agent-relay",
   "type": "module",
@@ -16,7 +16,7 @@
     ".": "./src/client.js"
   },
   "scripts": {
-    "check": "node --check bin/relay.js && node --check src/cli.js && node --check src/client.js && node --check src/daemon.js && node --check src/store.js && node --check src/tmux.js",
+    "check": "for file in bin/relay.js src/*.js test/*.test.js; do node --check \"$file\"; done",
     "test": "node --test test/*.test.js"
   }
 }

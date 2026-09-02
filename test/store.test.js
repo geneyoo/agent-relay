@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { RelayStore } from "../src/store.js";
+import { CURRENT_SCHEMA_VERSION, RelayStore } from "../src/store.js";
 
 function withStore(t) {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "agent-relay-store-"));
@@ -92,4 +92,9 @@ test("only the intended recipient can acknowledge a message", (t) => {
     (error) => error.code === "wrong_recipient",
   );
   assert.equal(store.requireMessage(message.id).state, "injected");
+});
+
+test("database records an explicit schema version", (t) => {
+  const store = withStore(t);
+  assert.equal(store.db.prepare("PRAGMA user_version").get().user_version, CURRENT_SCHEMA_VERSION);
 });
