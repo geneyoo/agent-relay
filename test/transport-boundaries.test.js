@@ -7,6 +7,7 @@ import test from "node:test";
 
 import { RelayClient } from "../src/client.js";
 import { RelayDaemon } from "../src/daemon.js";
+import { RelayStore } from "../src/store.js";
 
 const MAX_WIRE_BYTES = 2 * 1024 * 1024;
 
@@ -114,7 +115,9 @@ test("a rejected daemon cannot recover work or unlink the active daemon socket",
 
     releaseDelivery();
     const sent = await pendingSend;
-    assert.equal(sent.message.state, "injected");
+    assert.equal(sent.message.state, "queued");
+    await active.service.drain();
+    assert.equal((await client.show(sent.message.id)).state, "injected");
   } finally {
     releaseDelivery?.();
     await pendingSend?.catch(() => undefined);
@@ -149,6 +152,152 @@ test("daemon close preserves a replacement socket with a different inode", async
     await closeServer(replacement);
     fs.rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test("daemon startup schedules durable queued work", async () => {
+  const directory = temporaryDirectory("agent-relay-startup-queue-");
+  const socketPath = path.join(directory, "relay.sock");
+  const statePath = path.join(directory, "relay.sqlite");
+  const seeded = new RelayStore(statePath);
+  seeded.registerAgent({
+    id: "worker",
+    adapter: "codex",
+    tmuxSocket: "/tmp/fake-tmux.sock",
+    paneId: "%7",
+    panePid: 4242,
+    paneCommand: "codex",
+  });
+  const queued = seeded.createMessage({
+    sender: "coordinator",
+    recipient: "worker",
+    mode: "next",
+    body: "Resume after daemon restart",
+  }).message;
+  seeded.close();
+  const deliveries = [];
+  const daemon = new RelayDaemon({
+    socketPath,
+    statePath,
+    delivery: {
+      async inspect({ paneId }) {
+        return { paneId, panePid: 4242, paneCommand: "codex" };
+      },
+      async deliver(agent, message) {
+        deliveries.push({ agent, message });
+      },
+    },
+  });
+
+  try {
+    await daemon.listen();
+    await daemon.service.drain();
+    assert.equal(daemon.store.requireMessage(queued.id).state, "injected");
+    assert.deepEqual(deliveries.map(({ message }) => message.id), [queued.id]);
+  } finally {
+    await daemon.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("daemon shutdown drains an in-flight background delivery before closing state", async () => {
+  const directory = temporaryDirectory("agent-relay-shutdown-drain-");
+  const socketPath = path.join(directory, "relay.sock");
+  const statePath = path.join(directory, "relay.sqlite");
+  let release;
+  const deliveryStarted = new Promise((resolve) => { release = { started: resolve }; });
+  let finishDelivery;
+  const daemon = new RelayDaemon({
+    socketPath,
+    statePath,
+    delivery: {
+      async inspect({ paneId }) {
+        return { paneId, panePid: 4242, paneCommand: "codex" };
+      },
+      async deliver() {
+        release.started();
+        await new Promise((resolve) => { finishDelivery = resolve; });
+      },
+    },
+  });
+
+  try {
+    await daemon.listen();
+    const client = new RelayClient({ socketPath });
+    await client.register({
+      id: "worker",
+      adapter: "codex",
+      tmuxSocket: "/tmp/fake-tmux.sock",
+      paneId: "%7",
+    });
+    const sent = await client.send({ sender: "coordinator", recipient: "worker", body: "Finish the state write" });
+    await deliveryStarted;
+    let closed = false;
+    const closing = daemon.close().then(() => { closed = true; });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(closed, false);
+    finishDelivery();
+    await closing;
+
+    const reopened = new RelayStore(statePath);
+    try {
+      assert.equal(reopened.requireMessage(sent.message.id).state, "injected");
+    } finally {
+      reopened.close();
+    }
+  } finally {
+    finishDelivery?.();
+    await daemon.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("daemon shutdown drops idle partial clients instead of waiting forever", async () => {
+  const directory = temporaryDirectory("agent-relay-idle-client-");
+  const socketPath = path.join(directory, "relay.sock");
+  const daemon = new RelayDaemon({
+    socketPath,
+    statePath: path.join(directory, "relay.sqlite"),
+    delivery: {},
+  });
+  let idle;
+
+  try {
+    await daemon.listen();
+    idle = net.createConnection({ path: socketPath });
+    await new Promise((resolve, reject) => {
+      idle.once("connect", resolve);
+      idle.once("error", reject);
+    });
+    idle.write('{"op":"ping"');
+    const closing = daemon.close();
+    await Promise.race([
+      closing,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("daemon close remained blocked")), 500)),
+    ]);
+  } finally {
+    idle?.destroy();
+    await daemon.close();
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("a connection callback queued behind shutdown is destroyed immediately", () => {
+  const daemon = new RelayDaemon({
+    socketPath: "/tmp/not-opened-relay.sock",
+    statePath: "/tmp/not-opened-relay.sqlite",
+    delivery: {},
+  });
+  daemon.closed = true;
+  let destroyed = false;
+
+  daemon.handleConnection({
+    destroy() {
+      destroyed = true;
+    },
+  });
+
+  assert.equal(destroyed, true);
+  assert.equal(daemon.connections.size, 0);
 });
 
 test("daemon preserves UTF-8 split at every byte of a multibyte request character", async () => {

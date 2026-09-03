@@ -232,6 +232,7 @@ test("retrying next work cannot bypass an older queued next message", async (t) 
   store.markInjected(retried.id);
 
   const result = await service.retry({ id: retried.id, force: true });
+  await service.drain();
 
   assert.equal(result.state, "queued");
   assert.deepEqual(delivery.deliveries.map(({ message }) => message.id), [first.id]);
@@ -315,7 +316,8 @@ test("startup dispatch sends queued work but does not replay open states", async
     blocked.push({ open, queued, state });
   }
 
-  await service.dispatchQueued();
+  service.start();
+  await service.drain();
 
   assert.deepEqual(delivery.deliveries.map(({ message }) => message.id), [safe.id]);
   assert.equal(store.requireMessage(safe.id).state, "injected");

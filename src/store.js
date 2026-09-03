@@ -402,6 +402,27 @@ export class RelayStore {
     });
   }
 
+  cancelMessage(id, sender, force = false) {
+    validateAgentId(sender, "sender");
+    const existing = this.requireMessage(id);
+    assertRelay(existing.sender === sender, "wrong_sender", `${sender} is not the sender of ${id}`);
+    if (existing.state === "cancelled") return existing;
+    if (["injected", "uncertain"].includes(existing.state)) {
+      assertRelay(
+        force === true,
+        "cancel_requires_force",
+        "cancelling injected or uncertain work requires --force because the task may have reached the recipient",
+      );
+    }
+    return this.transition(
+      id,
+      force === true ? ["queued", "injected", "uncertain"] : ["queued"],
+      "cancelled",
+      "message_cancelled",
+      { details: { sender, forced: force === true } },
+    );
+  }
+
   requeueMessage(id, force) {
     const existing = this.requireMessage(id);
     if (existing.state === "queued") return existing;

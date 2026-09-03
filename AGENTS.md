@@ -12,6 +12,10 @@ agents already running in tmux panes.
 - Recover an interrupted injection as `uncertain`; never automatically replay
   a possibly delivered payload.
 - Treat message IDs and idempotency keys as the duplicate-delivery boundary.
+- Return a durable message handle before waiting on terminal delivery.
+- Bind acknowledgement and completion to the registered recipient identity.
+- Let only the original sender cancel unaccepted work, and never describe
+  forced cancellation as stopping work that may already have reached a pane.
 - Use argument arrays and stdin for tmux interaction. Never interpolate message
   bodies, pane IDs, or socket paths into shell source.
 - Bind locally through an owner-only Unix socket. Do not add a TCP listener by

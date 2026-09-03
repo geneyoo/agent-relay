@@ -100,6 +100,7 @@ export class RelayDaemon {
     this.socketIdentity = null;
     this.boundSocketPath = null;
     this.boundSocketIdentity = null;
+    this.connections = new Map();
     this.server = net.createServer((socket) => this.handleConnection(socket));
     this.closed = false;
   }
@@ -130,6 +131,7 @@ export class RelayDaemon {
           this.store = new RelayStore(this.statePath);
           this.store.recoverInterruptedDeliveries();
           this.service = new RelayService({ store: this.store, delivery: this.delivery });
+          this.service.start();
           resolve();
         } catch (error) {
           this.close().then(() => reject(error), reject);
@@ -139,10 +141,16 @@ export class RelayDaemon {
   }
 
   handleConnection(socket) {
+    if (this.closed) {
+      socket.destroy();
+      return;
+    }
     let request = "";
     let requestBytes = 0;
     let handled = false;
     const decoder = new StringDecoder("utf8");
+    const connection = { handled: false };
+    this.connections.set(socket, connection);
 
     const respond = (payload) => {
       if (socket.destroyed) return;
@@ -161,6 +169,7 @@ export class RelayDaemon {
       const newline = request.indexOf("\n");
       if (newline === -1) return;
       handled = true;
+      connection.handled = true;
       try {
         if (!this.service) throw new RelayError("daemon_not_ready", "relay daemon is not ready");
         const parsed = JSON.parse(request.slice(0, newline));
@@ -174,19 +183,25 @@ export class RelayDaemon {
     socket.on("error", () => {
       // A disconnected client must not terminate the daemon.
     });
+    socket.on("close", () => this.connections.delete(socket));
   }
 
   async close() {
     if (this.closed) return;
     this.closed = true;
     if (this.server.listening) {
-      await new Promise((resolve, reject) => {
+      const serverClosed = new Promise((resolve, reject) => {
         this.server.close((error) => {
           if (error) reject(error);
           else resolve();
         });
       });
+      for (const [socket, connection] of this.connections) {
+        if (!connection.handled) socket.destroy();
+      }
+      await serverClosed;
     }
+    await this.service?.drain();
     this.store?.close();
     this.store = null;
     this.service = null;

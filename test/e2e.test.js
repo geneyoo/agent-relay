@@ -47,7 +47,7 @@ test("public CLI completes a durable task delivered through a real tmux pane", {
       recipient: "fixture-worker",
       body: "Complete the deterministic fixture",
     });
-    assert.equal(sent.message.state, "injected");
+    assert.equal(sent.message.state, "queued");
 
     let completed;
     const deadline = Date.now() + 3000;

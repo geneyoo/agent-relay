@@ -1,6 +1,6 @@
 {
   "name": "@geneyoo/agent-relay",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A durable, headless message relay for terminal-based coding agents",
   "repository": "github:geneyoo/agent-relay",
   "type": "module",

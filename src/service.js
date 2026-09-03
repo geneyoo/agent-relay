@@ -40,12 +40,14 @@ export class RelayService {
         return this.finish(request, "completed");
       case "fail":
         return this.finish(request, "failed");
+      case "cancel":
+        return this.cancel(request);
       case "show":
         return this.show(request);
       case "inbox":
         return this.inbox(request);
       case "agents":
-        return this.store.listAgents();
+        return this.agents();
       case "status":
         return this.store.status();
       case "retry":
@@ -100,19 +102,32 @@ export class RelayService {
 
   accept({ id, agent = undefined }) {
     validateMessageId(id);
-    const message = this.store.requireMessage(id);
-    const resolvedAgent = agent ?? message.recipient;
-    validateAgentId(resolvedAgent);
-    return this.store.acceptMessage(id, resolvedAgent);
+    validateAgentId(agent);
+    const existing = this.store.requireMessage(id);
+    const acceptedNow = !["accepted", "completed", "failed"].includes(existing.state);
+    return { ...this.store.acceptMessage(id, agent), acceptedNow };
   }
 
   async finish({ id, agent = undefined, result = "" }, state) {
     validateMessageId(id);
+    validateAgentId(agent);
+    const message = this.store.finishMessage(id, agent, state, result);
+    this.runInBackground(message.recipient, () => (
+      this.withTargetLock(message.recipient, () => this.dispatchNextLocked(message.recipient))
+    ));
+    return message;
+  }
+
+  async cancel({ id, sender, force = false }) {
+    validateMessageId(id);
+    validateAgentId(sender, "sender");
     const existing = this.store.requireMessage(id);
-    const resolvedAgent = agent ?? existing.recipient;
-    validateAgentId(resolvedAgent);
-    const message = this.store.finishMessage(id, resolvedAgent, state, result);
-    await this.dispatchNext(message.recipient);
+    const message = await this.withTargetLock(existing.recipient, () => (
+      this.store.cancelMessage(id, sender, force)
+    ));
+    this.runInBackground(message.recipient, () => (
+      this.withTargetLock(message.recipient, () => this.dispatchNextLocked(message.recipient))
+    ));
     return message;
   }
 
@@ -128,11 +143,26 @@ export class RelayService {
   async retry({ id, force = false }) {
     validateMessageId(id);
     const existing = this.store.requireMessage(id);
-    return this.withTargetLock(existing.recipient, async () => {
-      this.store.requeueMessage(id, force);
-      await this.scheduleMessageLocked(id);
-      return this.store.requireMessage(id);
-    });
+    const message = await this.withTargetLock(existing.recipient, () => (
+      this.store.requeueMessage(id, force)
+    ));
+    this.runInBackground(message.recipient, () => (
+      this.withTargetLock(message.recipient, () => this.scheduleMessageLocked(id))
+    ));
+    return message;
+  }
+
+  async agents() {
+    return Promise.all(this.store.listAgents().map(async (agent) => {
+      try {
+        const fingerprint = await this.delivery.inspect(agent);
+        const online = fingerprint.panePid === agent.panePid
+          && (agent.adapter === "tmux" || fingerprint.paneCommand === agent.paneCommand);
+        return { ...agent, online };
+      } catch {
+        return { ...agent, online: false };
+      }
+    }));
   }
 
   async dispatchNext(recipient) {
@@ -227,7 +257,17 @@ export class RelayService {
     );
   }
 
+  start() {
+    for (const recipient of this.store.listQueuedRecipients()) {
+      this.runInBackground(recipient, () => (
+        this.withTargetLock(recipient, () => this.dispatchQueuedLocked(recipient))
+      ));
+    }
+  }
+
   async drain() {
-    await Promise.allSettled([...this.backgroundTasks]);
+    while (this.backgroundTasks.size > 0) {
+      await Promise.allSettled([...this.backgroundTasks]);
+    }
   }
 }

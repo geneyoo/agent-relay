@@ -39,6 +39,16 @@ async function withDaemon(t, delivery = new FakeDelivery()) {
   return { client: new RelayClient({ socketPath }), delivery, socketPath };
 }
 
+async function waitForState(client, id, state, timeoutMs = 2000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const message = await client.show(id);
+    if (message.state === state) return message;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.fail(`${id} did not reach ${state}`);
+}
+
 test("daemon delivers, accepts, and completes a message", async (t) => {
   const { client, delivery } = await withDaemon(t);
   await client.register({
@@ -54,7 +64,8 @@ test("daemon delivers, accepts, and completes a message", async (t) => {
     mode: "now",
     body: "Review the change",
   });
-  assert.equal(sent.message.state, "injected");
+  assert.equal(sent.message.state, "queued");
+  await waitForState(client, sent.message.id, "injected");
   assert.equal(delivery.deliveries.length, 1);
 
   assert.equal((await client.accept(sent.message.id, "reviewer")).state, "accepted");
@@ -85,14 +96,15 @@ test("next mode serializes work per recipient", async (t) => {
     body: "Second",
   });
 
-  assert.equal(first.message.state, "injected");
+  assert.equal(first.message.state, "queued");
+  await waitForState(client, first.message.id, "injected");
   assert.equal(second.message.state, "queued");
   assert.equal(delivery.deliveries.length, 1);
 
   await client.accept(first.message.id, "worker");
   await client.complete(first.message.id, "First done", "worker");
 
-  assert.equal((await client.show(second.message.id)).state, "injected");
+  await waitForState(client, second.message.id, "injected");
   assert.equal(delivery.deliveries.length, 2);
 });
 
@@ -113,7 +125,7 @@ test("send is durable while its recipient is unregistered", async (t) => {
     tmuxSocket: "/tmp/fake-tmux.sock",
     paneId: "%9",
   });
-  assert.equal((await client.show(sent.message.id)).state, "injected");
+  await waitForState(client, sent.message.id, "injected");
   assert.equal(delivery.deliveries.length, 1);
 });
 
@@ -131,7 +143,7 @@ test("provider adapter refuses a pane running the wrong foreground command", asy
   assert.deepEqual(await client.agents(), []);
 });
 
-test("client keeps the socket open for asynchronous delivery responses", async (t) => {
+test("client receives the durable ID before asynchronous delivery finishes", async (t) => {
   const { client } = await withDaemon(t, new FakeDelivery(25));
   const registered = await client.register({
     id: "slow-worker",
@@ -147,7 +159,8 @@ test("client keeps the socket open for asynchronous delivery responses", async (
     mode: "now",
     body: "Wait for the real response",
   });
-  assert.equal(sent.message.state, "injected");
+  assert.equal(sent.message.state, "queued");
+  await waitForState(client, sent.message.id, "injected");
 });
 
 test("auto registration detects the provider and resolves pane identity", async (t) => {
@@ -229,11 +242,57 @@ test("ask command prints only the completed result", async (t) => {
   }
   assert.ok(message, "ask did not create a message");
   assert.equal(message.sender, "coordinator");
-  await client.accept(message.id);
-  await client.complete(message.id, "One issue found");
+  await client.accept(message.id, "worker");
+  await client.complete(message.id, "One issue found", "worker");
 
   const exitCode = await new Promise((resolve) => child.once("close", resolve));
   assert.equal(exitCode, 0, stderr);
   assert.equal(stdout, "One issue found\n");
-  assert.match(stderr, new RegExp(`relay: ${message.id} injected; waiting for worker`));
+  assert.match(stderr, new RegExp(`relay: ${message.id} persisted; waiting for worker`));
+});
+
+test("CLI explicit recipient identity survives misleading tool pane coordinates", async (t) => {
+  const { client, socketPath } = await withDaemon(t);
+  await client.register({
+    id: "coordinator",
+    adapter: "claude",
+    tmuxSocket: "/tmp/fake-tmux.sock",
+    paneId: "%12",
+  });
+  await client.register({
+    id: "worker",
+    adapter: "codex",
+    tmuxSocket: "/tmp/fake-tmux.sock",
+    paneId: "%7",
+  });
+  const sent = await client.send({
+    sender: "coordinator",
+    recipient: "worker",
+    body: "Do not let the wrong pane acknowledge this",
+  });
+  await waitForState(client, sent.message.id, "injected");
+
+  const child = spawn(process.execPath, [
+    new URL("../bin/relay.js", import.meta.url).pathname,
+    "ack",
+    sent.message.id,
+    "--agent",
+    "worker",
+    "--socket",
+    socketPath,
+  ], {
+    stdio: ["ignore", "pipe", "pipe"],
+    env: {
+      ...process.env,
+      TMUX: "/tmp/fake-tmux.sock,123,0",
+      TMUX_PANE: "%12",
+      AGENT_RELAY_AGENT: "worker",
+    },
+  });
+  let stderr = "";
+  child.stderr.on("data", (chunk) => { stderr += chunk.toString("utf8"); });
+  const exitCode = await new Promise((resolve) => child.once("close", resolve));
+
+  assert.equal(exitCode, 0, stderr);
+  assert.equal((await client.show(sent.message.id)).state, "accepted");
 });

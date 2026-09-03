@@ -54,7 +54,7 @@ test("tmux adapter pastes the envelope and submits Enter separately", { skip: !t
   const captured = tmux(socketPath, ["capture-pane", "-p", "-J", "-t", paneId, "-S", "-100"]);
   assert.equal(captured.status, 0, captured.stderr);
   assert.match(captured.stdout, /RECEIVED:\[relay msg_a{32} from=coordinator\]/);
-  assert.match(captured.stdout, /RECEIVED:ACK NOW: relay ack msg_a{32}/);
+  assert.match(captured.stdout, /RECEIVED:ACK NOW: relay ack msg_a{32} --agent reviewer/);
   assert.match(captured.stdout, /RECEIVED:Line one/);
   assert.match(captured.stdout, /RECEIVED:Line two with 'quotes' and \$dollars/);
   assert.match(captured.stdout, /RECEIVED:\[\/relay\]/);

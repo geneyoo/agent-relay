@@ -77,6 +77,10 @@ relay peers
 relay doctor
 ```
 
+`relay peers` probes the registered pane and reports it as `online` or
+`offline`; a remembered registration is not presented as proof that its pane
+still exists.
+
 ## Ask another agent
 
 The normal coordinator operation is synchronous and returns only the worker's
@@ -86,13 +90,15 @@ result:
 relay ask reviewer "Review the authentication change"
 ```
 
-The relay persists and injects the task, waits up to 30 seconds for an explicit
-acknowledgement, waits for completion, and prints the result. Use `--timeout`
-to bound the work itself.
+The relay persists the task and returns its durable ID before terminal
+injection finishes, waits up to 120 seconds for an explicit acknowledgement,
+then waits for completion and prints the result. Use `--accept-timeout` to
+change the acknowledgement window and `--timeout` to bound the work itself.
+Either timeout only stops the caller's wait; it does not cancel durable work.
 
 ## Send asynchronously
 
-`send` injects immediately and prints only the durable message ID:
+`send` schedules immediate injection and prints only the durable message ID:
 
 ```bash
 message_id=$(relay send reviewer "Review the authentication change")
@@ -106,6 +112,19 @@ Use `queue` when the task must wait behind another open relay task:
 relay queue reviewer "Run this after the current relay task"
 ```
 
+Queued work is scheduled again after daemon restart or recipient
+re-registration. If obsolete work is blocking a `queue`, its original sender
+can withdraw it:
+
+```bash
+relay cancel msg_...                 # queued and not delivered
+relay cancel msg_... --force         # injected/uncertain; may already be visible
+```
+
+Cancellation is not remote process termination. Accepted work cannot be
+cancelled through the relay; coordinate with the recipient and let it report a
+truthful terminal result.
+
 Use stdin for arbitrary or multiline content:
 
 ```bash
@@ -116,15 +135,18 @@ printf '%s' 'Review the authentication change.' |
 The recipient follows the commands embedded in the delivered envelope:
 
 ```bash
-relay ack msg_...
-relay done msg_... "Review complete; found one race condition"
+relay ack msg_... --agent reviewer
+relay done msg_... "Review complete; found one race condition" --agent reviewer
 # or
-relay fail msg_... "Blocked by a missing dependency"
+relay fail msg_... "Blocked by a missing dependency" --agent reviewer
 ```
 
-`send` attempts immediate terminal injection. A terminal adapter cannot prove
-that an application semantically steered its active turn; only the explicit
-`ack` establishes acceptance.
+`send` schedules immediate terminal injection. Its returned snapshot may still
+say `queued`; use `relay show`, `relay wait`, or `relay ask` for later states.
+The client assigns an idempotency key and retries one lost response with that
+same key, so a response timeout does not create a duplicate. A terminal
+adapter cannot prove that an application semantically steered its active turn;
+only the recipient's explicit, identity-bound `ack` establishes acceptance.
 
 From another machine, use the existing SSH trust path rather than exposing a
 new network service:
@@ -148,6 +170,10 @@ user-level instructions. The rule teaches agents to discover peers with
   `~/.local/state/agent-relay/relay.sqlite`
 - Socket and database permissions: owner-only
 - No TCP listener and no WebSocket in protocol v1
+
+The daemon wins exclusive ownership of the Unix socket before opening or
+recovering the database. Possibly delivered tmux pastes recover as `uncertain`
+and are never replayed automatically.
 
 Message bodies and results are operational data and are never stored in this
 Git repository. The Unix account is the trust boundary for protocol v1.

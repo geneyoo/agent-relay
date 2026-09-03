@@ -1,4 +1,5 @@
 import net from "node:net";
+import { randomBytes } from "node:crypto";
 import { StringDecoder } from "node:string_decoder";
 
 import { RelayError } from "./errors.js";
@@ -91,7 +92,14 @@ export class RelayClient {
   }
 
   send(input) {
-    return this.request("send", input, { timeoutMs: 15000 });
+    const payload = {
+      ...input,
+      idempotencyKey: input.idempotencyKey ?? `client-${randomBytes(16).toString("hex")}`,
+    };
+    return this.request("send", payload).catch((error) => {
+      if (!["request_timeout", "empty_response", "ECONNRESET", "EPIPE"].includes(error.code)) throw error;
+      return this.request("send", payload);
+    });
   }
 
   accept(id, agent = undefined) {
@@ -104,6 +112,10 @@ export class RelayClient {
 
   fail(id, result = "", agent = undefined) {
     return this.request("fail", { id, agent, result });
+  }
+
+  cancel(id, sender, force = false) {
+    return this.request("cancel", { id, sender, force });
   }
 
   show(id) {
@@ -123,6 +135,6 @@ export class RelayClient {
   }
 
   retry(id, force = false) {
-    return this.request("retry", { id, force }, { timeoutMs: 15000 });
+    return this.request("retry", { id, force });
   }
 }

@@ -13,12 +13,13 @@ Usage:
   relay daemon ping [--socket PATH]
   relay join NAME
   relay start NAME -- COMMAND [ARG...]
-  relay ask RECIPIENT MESSAGE [--timeout SECONDS]
+  relay ask RECIPIENT MESSAGE [--accept-timeout SECONDS] [--timeout SECONDS]
   relay send RECIPIENT MESSAGE
   relay queue RECIPIENT MESSAGE
   relay ack MESSAGE_ID
   relay done MESSAGE_ID RESULT
   relay fail MESSAGE_ID RESULT
+  relay cancel MESSAGE_ID [--force]
   relay result MESSAGE_ID
   relay show MESSAGE_ID
   relay inbox [--agent NAME] [--state STATE] [--include-body]
@@ -108,7 +109,8 @@ function availableTmuxCoordinates(options = {}) {
 
 async function identifyCurrentAgent(client, options = {}) {
   if (options.agent) return options.agent;
-  if (process.env.AGENT_RELAY_AGENT) return process.env.AGENT_RELAY_AGENT;
+  const environmentAgent = process.env.AGENT_RELAY_AGENT || null;
+  if (environmentAgent) return environmentAgent;
   const coordinates = availableTmuxCoordinates(options);
   if (!coordinates) return null;
   const agent = await client.identify(coordinates);
@@ -335,7 +337,9 @@ export async function main(argv) {
       const body = await bodyFrom(parsed, 1);
       if (command === "ask") {
         const peers = await client.agents();
-        assertRelay(peers.some((peer) => peer.id === recipient), "unknown_recipient", `${recipient} has not joined the relay`);
+        const peer = peers.find((candidate) => candidate.id === recipient);
+        assertRelay(peer, "unknown_recipient", `${recipient} has not joined the relay`);
+        assertRelay(peer.online, "recipient_offline", `${recipient} is not currently reachable; use relay send or relay queue for durable offline delivery`);
       }
       const result = await client.send({
         sender: await senderFrom(client, parsed.options),
@@ -350,9 +354,8 @@ export async function main(argv) {
         return;
       }
 
-      assertRelay(result.message.state === "injected" || result.message.state === "accepted" || result.message.state === "completed", "delivery_not_confirmed", `${result.message.id} is ${result.message.state}; inspect it with relay show ${result.message.id}`);
-      if (!parsed.options.json) process.stderr.write(`relay: ${result.message.id} injected; waiting for ${recipient}\n`);
-      const acceptTimeout = Number(parsed.options["accept-timeout"] || 30);
+      if (!parsed.options.json) process.stderr.write(`relay: ${result.message.id} persisted; waiting for ${recipient}\n`);
+      const acceptTimeout = Number(parsed.options["accept-timeout"] || 120);
       await waitForMessage(client, result.message.id, "accepted", acceptTimeout);
       const completed = await waitForMessage(client, result.message.id, "completed", Number(parsed.options.timeout || 0));
       print(parsed.options.json ? completed : (completed.result || `${completed.id} completed`), parsed.options.json);
@@ -362,8 +365,11 @@ export async function main(argv) {
     case "accept": {
       const id = parsed.positional[0];
       assertRelay(id, "message_required", `${command} requires a message ID`);
-      const result = await client.accept(id, parsed.options.agent);
-      print(parsed.options.json ? result : `acknowledged ${result.id}`, parsed.options.json);
+      const agent = await identifyCurrentAgent(client, parsed.options);
+      assertRelay(agent, "agent_required", `${command} must run from the recipient's joined pane or use --agent NAME`);
+      const result = await client.accept(id, agent);
+      const acknowledgement = result.acceptedNow ? `acknowledged ${result.id}` : `${result.id} already ${result.state}`;
+      print(parsed.options.json ? result : acknowledgement, parsed.options.json);
       return;
     }
     case "done":
@@ -372,10 +378,20 @@ export async function main(argv) {
       const id = parsed.positional[0];
       assertRelay(id, "message_required", `${command} requires a message ID`);
       const resultBody = await bodyFrom(parsed, 1);
+      const agent = await identifyCurrentAgent(client, parsed.options);
+      assertRelay(agent, "agent_required", `${command} must run from the recipient's joined pane or use --agent NAME`);
       const result = command === "fail"
-        ? await client.fail(id, resultBody, parsed.options.agent)
-        : await client.complete(id, resultBody, parsed.options.agent);
+        ? await client.fail(id, resultBody, agent)
+        : await client.complete(id, resultBody, agent);
       print(parsed.options.json ? result : `${result.state} ${result.id}`, parsed.options.json);
+      return;
+    }
+    case "cancel": {
+      const id = parsed.positional[0];
+      assertRelay(id, "message_required", "cancel requires a message ID");
+      const sender = await senderFrom(client, parsed.options);
+      const result = await client.cancel(id, sender, parsed.options.force === true);
+      print(parsed.options.json ? result : `cancelled ${result.id}`, parsed.options.json);
       return;
     }
     case "show": {
@@ -409,7 +425,7 @@ export async function main(argv) {
         const agents = await client.agents();
         if (parsed.options.json) print(agents, true);
         else if (agents.length === 0) process.stdout.write("no agents have joined\n");
-        else for (const agent of agents) process.stdout.write(`${agent.id}\t${agent.adapter}\t${agent.paneId}${agent.lastError ? `\t${agent.lastError}` : ""}\n`);
+        else for (const agent of agents) process.stdout.write(`${agent.id}\t${agent.online ? "online" : "offline"}\t${agent.adapter}\t${agent.paneId}${agent.lastError ? `\t${agent.lastError}` : ""}\n`);
       }
       return;
     case "whoami": {
