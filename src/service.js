@@ -20,6 +20,7 @@ export class RelayService {
     this.store = store;
     this.delivery = delivery;
     this.targetLocks = new Map();
+    this.backgroundTasks = new Set();
   }
 
   async handle(request) {
@@ -57,18 +58,20 @@ export class RelayService {
   async register({ id, adapter = "auto", tmuxSocket, paneId }) {
     validateAgentId(id);
     assertRelay(SUPPORTED_ADAPTERS.has(adapter), "unsupported_adapter", `unsupported adapter: ${adapter}`);
-    const fingerprint = await this.delivery.inspect({ tmuxSocket, paneId });
-    const resolvedAdapter = adapter === "auto" ? detectAdapter(fingerprint.paneCommand) : adapter;
-    assertRelay(adapterMatchesCommand(resolvedAdapter, fingerprint.paneCommand), "adapter_not_ready", `pane ${paneId} currently runs ${fingerprint.paneCommand}, not ${resolvedAdapter}`);
-    const agent = this.store.registerAgent({
-      id,
-      adapter: resolvedAdapter,
-      tmuxSocket,
-      paneId: fingerprint.paneId,
-      panePid: fingerprint.panePid,
-      paneCommand: fingerprint.paneCommand,
+    const agent = await this.withTargetLock(id, async () => {
+      const fingerprint = await this.delivery.inspect({ tmuxSocket, paneId });
+      const resolvedAdapter = adapter === "auto" ? detectAdapter(fingerprint.paneCommand) : adapter;
+      assertRelay(adapterMatchesCommand(resolvedAdapter, fingerprint.paneCommand), "adapter_not_ready", `pane ${paneId} currently runs ${fingerprint.paneCommand}, not ${resolvedAdapter}`);
+      return this.store.registerAgent({
+        id,
+        adapter: resolvedAdapter,
+        tmuxSocket,
+        paneId: fingerprint.paneId,
+        panePid: fingerprint.panePid,
+        paneCommand: fingerprint.paneCommand,
+      });
     });
-    await this.dispatchNext(id);
+    this.runInBackground(id, () => this.withTargetLock(id, () => this.dispatchQueuedLocked(id)));
     return agent;
   }
 
@@ -87,14 +90,12 @@ export class RelayService {
 
   async send({ sender, recipient, parentId = null, mode = "now", body, idempotencyKey = null }) {
     const created = this.store.createMessage({ sender, recipient, parentId, mode, body, idempotencyKey });
-    if (!created.created) return created;
-    const message = await this.withTargetLock(recipient, async () => {
-      if (mode === "next" && this.store.hasOpenMessage(recipient, created.message.id)) {
-        return this.store.requireMessage(created.message.id);
-      }
-      return this.attemptDelivery(created.message.id);
-    });
-    return { message, created: true };
+    if (created.message.state === "queued") {
+      this.runInBackground(created.message.recipient, () => this.withTargetLock(created.message.recipient, () => (
+        this.scheduleMessageLocked(created.message.id)
+      )));
+    }
+    return created;
   }
 
   accept({ id, agent = undefined }) {
@@ -125,18 +126,58 @@ export class RelayService {
   }
 
   async retry({ id, force = false }) {
-    const requeued = this.store.requeueMessage(id, force);
-    const message = await this.withTargetLock(requeued.recipient, () => this.attemptDelivery(id));
-    return message;
+    validateMessageId(id);
+    const existing = this.store.requireMessage(id);
+    return this.withTargetLock(existing.recipient, async () => {
+      this.store.requeueMessage(id, force);
+      await this.scheduleMessageLocked(id);
+      return this.store.requireMessage(id);
+    });
   }
 
   async dispatchNext(recipient) {
-    return this.withTargetLock(recipient, async () => {
-      const next = this.store.nextQueued(recipient);
-      if (!next) return undefined;
-      if (next.mode === "next" && this.store.hasOpenMessage(recipient, next.id)) return next;
-      return this.attemptDelivery(next.id);
-    });
+    return this.withTargetLock(recipient, () => this.dispatchNextLocked(recipient));
+  }
+
+  async dispatchQueued() {
+    const recipients = this.store.listQueuedRecipients();
+    return Promise.all(recipients.map((recipient) => (
+      this.withTargetLock(recipient, () => this.dispatchQueuedLocked(recipient))
+    )));
+  }
+
+  async dispatchQueuedLocked(recipient) {
+    const dispatched = [];
+    const queued = this.store.listQueued(recipient);
+    for (const snapshot of queued) {
+      const current = this.store.requireMessage(snapshot.id);
+      if (current.state !== "queued") continue;
+
+      if (current.mode === "next") {
+        const next = this.store.nextQueued(recipient);
+        if (!next || next.id !== current.id || this.store.hasOpenMessage(recipient)) break;
+        dispatched.push(await this.attemptDelivery(current.id));
+        break;
+      }
+
+      dispatched.push(await this.attemptDelivery(current.id));
+    }
+    return dispatched;
+  }
+
+  async dispatchNextLocked(recipient) {
+    const next = this.store.nextQueued(recipient);
+    if (!next) return undefined;
+    if (next.mode === "next" && this.store.hasOpenMessage(recipient)) return next;
+    return this.attemptDelivery(next.id);
+  }
+
+  async scheduleMessageLocked(id) {
+    const message = this.store.requireMessage(id);
+    if (message.state !== "queued") return message;
+    if (message.mode === "now") return this.attemptDelivery(id);
+    await this.dispatchNextLocked(message.recipient);
+    return this.store.requireMessage(id);
   }
 
   async attemptDelivery(id) {
@@ -168,5 +209,25 @@ export class RelayService {
     return current.finally(() => {
       if (this.targetLocks.get(target) === current) this.targetLocks.delete(target);
     });
+  }
+
+  runInBackground(target, fn) {
+    const task = Promise.resolve().then(fn);
+    this.backgroundTasks.add(task);
+    task.then(
+      () => this.backgroundTasks.delete(task),
+      (error) => {
+        this.backgroundTasks.delete(task);
+        try {
+          this.store.setAgentError(target, `${error.code ?? "dispatch_failed"}: ${error.message}`);
+        } catch {
+          // The rejected task is handled even if its diagnostic cannot be persisted.
+        }
+      },
+    );
+  }
+
+  async drain() {
+    await Promise.allSettled([...this.backgroundTasks]);
   }
 }

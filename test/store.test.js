@@ -52,7 +52,7 @@ test("idempotency key returns the original message", (t) => {
   const second = store.createMessage({
     sender: "coordinator",
     recipient: "reviewer",
-    body: "Different body",
+    body: "First body",
     idempotencyKey: "task-42-review",
   });
 

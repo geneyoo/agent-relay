@@ -260,7 +260,19 @@ export class RelayStore {
       if (idempotencyKey !== null) {
         const existing = this.db.prepare("SELECT * FROM messages WHERE sender = ? AND idempotency_key = ?")
           .get(sender, idempotencyKey);
-        if (existing) return { message: mapMessage(existing), created: false };
+        if (existing) {
+          const isExactReplay = existing.recipient === recipient
+            && (existing.parent_id ?? null) === parentId
+            && existing.mode === mode
+            && existing.body === body;
+          assertRelay(
+            isExactReplay,
+            "idempotency_conflict",
+            `idempotency key already identifies message ${existing.id}`,
+            { messageId: existing.id },
+          );
+          return { message: mapMessage(existing), created: false };
+        }
       }
 
       const id = messageId();
@@ -304,9 +316,26 @@ export class RelayStore {
     return mapMessage(this.db.prepare(`
       SELECT * FROM messages
       WHERE recipient = ? AND state = 'queued'
-      ORDER BY CASE mode WHEN 'now' THEN 0 ELSE 1 END, created_at
+      ORDER BY CASE mode WHEN 'now' THEN 0 ELSE 1 END, created_at, rowid
       LIMIT 1
     `).get(recipient));
+  }
+
+  listQueued(recipient) {
+    validateAgentId(recipient);
+    return this.db.prepare(`
+      SELECT * FROM messages
+      WHERE recipient = ? AND state = 'queued'
+      ORDER BY CASE mode WHEN 'now' THEN 0 ELSE 1 END, created_at, rowid
+    `).all(recipient).map((row) => mapMessage(row));
+  }
+
+  listQueuedRecipients() {
+    return this.db.prepare(`
+      SELECT DISTINCT recipient FROM messages
+      WHERE state = 'queued'
+      ORDER BY recipient
+    `).all().map((row) => row.recipient);
   }
 
   hasOpenMessage(recipient, exceptId = null) {
@@ -358,7 +387,14 @@ export class RelayStore {
     assertRelay(typeof result === "string" && Buffer.byteLength(result, "utf8") <= 64 * 1024, "result_too_large", "result exceeds 64 KiB");
     const existing = this.requireMessage(id);
     assertRelay(existing.recipient === agent, "wrong_recipient", `${agent} is not the recipient of ${id}`);
-    if (existing.state === state) return existing;
+    if (existing.state === state) {
+      assertRelay(
+        existing.result === result,
+        "terminal_result_conflict",
+        `${id} is already ${state} with a different result`,
+      );
+      return existing;
+    }
     return this.transition(id, ["accepted"], state, state === "completed" ? "message_completed" : "message_failed", {
       timestampField: "completed_at",
       result,
